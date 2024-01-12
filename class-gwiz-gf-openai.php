@@ -14,6 +14,7 @@ GFForms::include_feed_addon_framework();
  * @todo Make notes configurable
  * @todo Make saving to meta configurable
  */
+
 class GWiz_GF_OpenAI extends GFFeedAddOn
 {
 
@@ -602,7 +603,8 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 					array('value' => 'edits', 'label' => __('Edits', 'gravityforms-openai'), 'tooltip' => 'openai_endpoint_edits'),
 					array('value' => 'moderations', 'label' => __('Moderations', 'gravityforms-openai'), 'tooltip' => 'openai_endpoint_moderations'),
 					// Add Whisper endpoint choice
-					array('value' => 'whisper', 'label' => __('Whisper (Audio Transcriptions)', 'gravityforms-openai'))
+					array('value' => 'whisper', 'label' => __('Whisper (Audio Transcriptions)', 'gravityforms-openai')),
+					array('value' => 'pronunciation', 'label' => __('Pronunciation Assessment', 'gravityforms-openai')),
 				),
 				'default_value' => 'completions',
 			),
@@ -629,6 +631,34 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 				// Other properties as needed
 			),
 			$this->feed_setting_map_result_to_field('whisper')
+			// Add other settings as needed
+		);
+		$pronunciation_fields = array(
+			array(
+				'name' => 'pronunciation_model',
+				'tooltip' => 'Select the Pronunciation Assessment model to use.',
+				'label' => __('Pronunciation Assessment Model', 'gravityforms-openai'),
+				'type' => 'radio',
+				'choices' => array(
+					array('value' => 'pronunciation-1', 'label' => __('Pronunciation Assessment Model 1', 'gravityforms-openai')),
+					// Add other model options as needed
+				),
+				'required' => true,
+			),
+			array(
+				'name' => 'pronunciation_file_field',
+				'type' => 'field_select',
+				'label' => __('Select File Upload Field', 'gravityforms-openai'),
+				'description' => __('Choose the file upload field to use for Pronunciation Assessment API.', 'gravityforms-openai'),
+				// Other properties as needed
+			),
+			$this->feed_setting_map_result_to_field('pronunciation'),
+			 array(
+				'name' =>'pronunciation_map_text_field',
+				'type' => 'field_select',
+				'label' => __('Map text fields for pronunciation', 'gravityforms-openai'),
+				'description' => __('Get the text from whisper API field to check pronunciation against.', 'gravityforms-openai'),
+			),
 			// Add other settings as needed
 		);
 
@@ -921,6 +951,19 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 						array(
 							'field' => 'endpoint',
 							'values' => array('whisper'),
+						),
+					),
+				),
+			),
+			array(
+				'title' => 'Pronunciation Assessment API Settings',
+				'fields' => $pronunciation_fields,
+				'dependency' => array(
+					'live' => true,
+					'fields' => array(
+						array(
+							'field' => 'endpoint',
+							'values' => array('pronunciation'),
 						),
 					),
 				),
@@ -1272,6 +1315,9 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 			case 'whisper':
 				$entry = $this->process_endpoint_whisper($feed, $entry, $form);
 				break;
+			case 'pronunciation':
+				$entry = $this->process_endpoint_pronunciation($feed, $entry, $form);
+				break;
 
 			default:
 				// translators: placeholder is an unknown OpenAI endpoint.
@@ -1529,6 +1575,60 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 		return $entry;
 	}
 
+	public function process_endpoint_pronunciation($feed, $entry, $form)
+	{
+		$model = rgar($feed['meta'], 'pronunciation_model', 'pronunciation-1');
+		$file_field_id = rgar($feed['meta'], 'pronunciation_file_field');
+		$transcript_field_id = rgar($feed['meta'], 'pronunciation_map_text_field');
+
+		// Get the file URLs from the entry (assuming it returns an array of URLs)
+		$file_urls = rgar($entry, $file_field_id);
+		$combined_text = '';
+
+		foreach ($file_urls as $file_url) {
+			$this->log_debug("File URL from entry: " . $file_url);
+
+			$file_path = $this->convert_url_to_path($file_url);
+
+			if (is_readable($file_path)) {
+				$this->log_debug("File is accessible: " . $file_path);
+				$curl_file = curl_file_create($file_path, 'audio/mpeg', basename($file_path));
+//				$body = array('file' => $curl_file, 'model' => $model);
+				$body = [
+					'file'=>$file_path,
+					'text'=>$entry[$transcript_field_id],
+				];
+				$response = $this->make_request('audio/pronunciation', $body, $feed, 'pronunciation');
+				$this->log_debug("Raw Pronunciation Assessment API response: " . print_r($response, true));
+
+				if (is_wp_error($response)) {
+					$this->add_feed_error($response->get_error_message(), $feed, $entry, $form);
+				} else if (rgar($response, 'error')) {
+					$this->add_feed_error($response['error']['message'], $feed, $entry, $form);
+				} else {
+//					$text = $this->get_text_from_response($response);
+					$res = $response['NBest'][0];
+					$text = "Confidence: $res[Confidence] Accuracy: $res[AccuracyScore] Text: $res[Display]";
+					if (!is_wp_error($text)) {
+						$combined_text .= $text . "\n"; // Append the text with a newline
+					} else {
+						$this->add_feed_error($text->get_error_message(), $feed, $entry, $form);
+					}
+				}
+			} else {
+				$this->log_debug("File is not accessible or does not exist: " . $file_path);
+			}
+		}
+
+		if (!empty($combined_text)) {
+			GFAPI::add_note($entry['id'], 0, 'Pronunciation Assessment API Response (' . $feed['meta']['feed_name'] . ')', $combined_text);
+			$entry = $this->maybe_save_result_to_field($feed, $entry, $form, $combined_text);
+		}
+
+		gform_add_meta($entry['id'], 'pronunciation_response_' . $feed['id'], $combined_text);
+		return $entry;
+	}
+
 	public function convert_url_to_path($url)
 	{
 		// Check if $url is in JSON format and decode it
@@ -1585,7 +1685,7 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 
 		$this->log_debug("Mapping result to field ID: " . $map_result_to_field);
 
-		$field = GFAPI::get_field($form, (int) $map_result_to_field);
+		$field = GFAPI::get_field($form, (int)$map_result_to_field);
 
 		if (rgar($field, 'useRichTextEditor')) {
 			$text = wp_kses_post($text);
@@ -1716,8 +1816,8 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 	/**
 	 * Returns validation error message markup.
 	 *
-	 * @param string $validation_message  The validation message to add to the markup.
-	 * @param array  $form                The submitted form data.
+	 * @param string $validation_message The validation message to add to the markup.
+	 * @param array $form The submitted form data.
 	 *
 	 * @return false|string
 	 */
@@ -1811,13 +1911,13 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 	/**
 	 * Replace merge tags using the OpenAI response.
 	 *
-	 * @param string      $text       The text in which merge tags are being processed.
-	 * @param false|array $form       The Form object if available or false.
-	 * @param false|array $entry      The Entry object if available or false.
-	 * @param bool        $url_encode Indicates if the urlencode function should be applied.
-	 * @param bool        $esc_html   Indicates if the esc_html function should be applied.
-	 * @param bool        $nl2br      Indicates if the nl2br function should be applied.
-	 * @param string      $format     The format requested for the location the merge is being used. Possible values: html, text or url.
+	 * @param string $text The text in which merge tags are being processed.
+	 * @param false|array $form The Form object if available or false.
+	 * @param false|array $entry The Entry object if available or false.
+	 * @param bool $url_encode Indicates if the urlencode function should be applied.
+	 * @param bool $esc_html Indicates if the esc_html function should be applied.
+	 * @param bool $nl2br Indicates if the nl2br function should be applied.
+	 * @param string $format The format requested for the location the merge is being used. Possible values: html, text or url.
 	 *
 	 * @return string The text with merge tags processed.
 	 */
@@ -1884,7 +1984,7 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 		$feed = $this->get_feed($feed_id);
 		$endpoint = rgars($feed, 'meta/endpoint');
 
-		if (!$endpoint || (int) rgar($feed, 'form_id') !== (int) rgar($form, 'id')) {
+		if (!$endpoint || (int)rgar($feed, 'form_id') !== (int)rgar($form, 'id')) {
 			return '';
 		}
 
@@ -2057,6 +2157,7 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 	 */
 	public function make_request($endpoint, $body, $feed)
 	{
+
 		static $request_cache = array();
 
 		// Identify the user meber ship or role
@@ -2073,9 +2174,12 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 		}
 
 		$cache_body = $body;
-		if (isset($cache_body['file']) && $cache_body['file'] instanceof CURLFile) {
+		if ($cache_body instanceof CURLFile) {
+			$cache_body = 'curl-file';
+		}else if (isset($cache_body['file']) && $cache_body['file'] instanceof CURLFile) {
 			unset($cache_body['file']); // Exclude the CURLFile object
 		}
+//		dd([$endpoint,$body,$feed]);
 		$cache_key = sha1(
 			serialize(
 				array(
@@ -2110,7 +2214,6 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 
 			// Create a new cURL resource
 			$ch = curl_init();
-
 			// Set the URL and other options
 			curl_setopt($ch, CURLOPT_URL, $url);
 			curl_setopt($ch, CURLOPT_POST, true);
@@ -2150,30 +2253,95 @@ class GWiz_GF_OpenAI extends GFFeedAddOn
 			}
 
 			// Handle the response data as needed
+//			dd($response_data);
+			return $response_data;
+		}
+		if ($endpoint === 'audio/pronunciation') {
+			// Special handling for Pronunciation Assessment API
+			$url = 'https://eastus.stt.speech.microsoft.com/speech/recognition/conversation/cognitiveservices/v1?language=en-US&format=simple'; // Direct URL for Pronunciation Assessment API
+
+			$settings = $this->get_plugin_settings();
+//			$secret_key = $this->getBestSecretKey();
+			$secret_key = 'ad5c38b8edf14fc382ac17533393df30';
+			$transcript =$body['text'];
+			dump($transcript);
+//			dd($body,$feed,$transcript);
+			// Create a new cURL resource
+			$pronunciationParams = [
+				'ReferenceText'=>$transcript,
+			];
+			$pronunciationParamsJson = json_encode($pronunciationParams);
+			$pronunciationParamsBase64 = base64_encode($pronunciationParamsJson);
+//			dd($pronunciationParamsBase64);
+			$ch = curl_init();
+
+			// Set the URL and other options
+			curl_setopt($ch, CURLOPT_URL, $url);
+			curl_setopt($ch, CURLOPT_POST, true);
+			curl_setopt($ch, CURLOPT_POSTFIELDS, file_get_contents($body['file']));
+			curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+			curl_setopt(
+				$ch,
+				CURLOPT_HTTPHEADER,
+				array(
+					'Authorization: Bearer ' . $secret_key,
+					'Ocp-Apim-Subscription-Key: ' . $secret_key,
+//					'Authorization: Bearer ' . $settings[$secret_key],
+					'Content-Type: audio/wav',
+					"Pronunciation-Assessment: $pronunciationParamsBase64",
+				)
+			);
+
+			// Execute the request and capture the response
+			$response = curl_exec($ch);
+//			dd($transcript);
+//			dd($response);
+			// Check for cURL errors
+			if (curl_errno($ch)) {
+				$error_msg = curl_error($ch);
+				curl_close($ch);
+				$this->log_debug("Whisper API request error: " . $error_msg);
+				return;
+			}
+
+			// Close cURL resource
+			curl_close($ch);
+
+			// Process the response
+			$this->log_debug("Pronunciation Assessment API response: " . $response);
+
+			// Assuming the response is a JSON string, you might want to decode it
+			$response_data = json_decode($response, true);
+			if (json_last_error() !== JSON_ERROR_NONE) {
+				$this->log_debug("Error decoding JSON response: " . json_last_error_msg());
+				return;
+			}
+//			dd($response_data);
+			// Handle the response data as needed
 
 			return $response_data;
 		}
 
 		switch ($endpoint) {
 			case 'completions':
-				$body['max_tokens'] = (float) rgar($feed['meta'], $endpoint . '_' . 'max_tokens', $this->default_settings['completions']['max_tokens']);
-				$body['temperature'] = (float) rgar($feed['meta'], $endpoint . '_' . 'temperature', $this->default_settings['completions']['temperature']);
-				$body['top_p'] = (float) rgar($feed['meta'], $endpoint . '_' . 'top_p', $this->default_settings['completions']['top_p']);
-				$body['frequency_penalty'] = (float) rgar($feed['meta'], $endpoint . '_' . 'frequency_penalty', $this->default_settings['completions']['frequency_penalty']);
-				$body['presence_penalty'] = (float) rgar($feed['meta'], $endpoint . '_' . 'presence_penalty', $this->default_settings['completions']['presence_penalty']);
+				$body['max_tokens'] = (float)rgar($feed['meta'], $endpoint . '_' . 'max_tokens', $this->default_settings['completions']['max_tokens']);
+				$body['temperature'] = (float)rgar($feed['meta'], $endpoint . '_' . 'temperature', $this->default_settings['completions']['temperature']);
+				$body['top_p'] = (float)rgar($feed['meta'], $endpoint . '_' . 'top_p', $this->default_settings['completions']['top_p']);
+				$body['frequency_penalty'] = (float)rgar($feed['meta'], $endpoint . '_' . 'frequency_penalty', $this->default_settings['completions']['frequency_penalty']);
+				$body['presence_penalty'] = (float)rgar($feed['meta'], $endpoint . '_' . 'presence_penalty', $this->default_settings['completions']['presence_penalty']);
 				break;
 
 			case 'chat/completions':
-				$body['max_tokens'] = (float) rgar($feed['meta'], $endpoint . '_' . 'max_tokens', $this->default_settings['chat/completions']['max_tokens']);
-				$body['temperature'] = (float) rgar($feed['meta'], $endpoint . '_' . 'temperature', $this->default_settings['chat/completions']['temperature']);
-				$body['top_p'] = (float) rgar($feed['meta'], $endpoint . '_' . 'top_p', $this->default_settings['chat/completions']['top_p']);
-				$body['frequency_penalty'] = (float) rgar($feed['meta'], $endpoint . '_' . 'frequency_penalty', $this->default_settings['chat/completions']['frequency_penalty']);
-				$body['presence_penalty'] = (float) rgar($feed['meta'], $endpoint . '_' . 'presence_penalty', $this->default_settings['chat/completions']['presence_penalty']);
+				$body['max_tokens'] = (float)rgar($feed['meta'], $endpoint . '_' . 'max_tokens', $this->default_settings['chat/completions']['max_tokens']);
+				$body['temperature'] = (float)rgar($feed['meta'], $endpoint . '_' . 'temperature', $this->default_settings['chat/completions']['temperature']);
+				$body['top_p'] = (float)rgar($feed['meta'], $endpoint . '_' . 'top_p', $this->default_settings['chat/completions']['top_p']);
+				$body['frequency_penalty'] = (float)rgar($feed['meta'], $endpoint . '_' . 'frequency_penalty', $this->default_settings['chat/completions']['frequency_penalty']);
+				$body['presence_penalty'] = (float)rgar($feed['meta'], $endpoint . '_' . 'presence_penalty', $this->default_settings['chat/completions']['presence_penalty']);
 				break;
 
 			case 'edits':
-				$body['temperature'] = (float) rgar($feed['meta'], $endpoint . '_' . 'temperature', $this->default_settings['edits']['temperature']);
-				$body['top_p'] = (float) rgar($feed['meta'], $endpoint . '_' . 'top_p', $this->default_settings['edits']['top_p']);
+				$body['temperature'] = (float)rgar($feed['meta'], $endpoint . '_' . 'temperature', $this->default_settings['edits']['temperature']);
+				$body['top_p'] = (float)rgar($feed['meta'], $endpoint . '_' . 'top_p', $this->default_settings['edits']['top_p']);
 				break;
 		}
 
